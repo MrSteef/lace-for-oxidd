@@ -435,6 +435,9 @@ impl Worker {
     fn thread(mut self, #[cfg(any(feature = "numa_awareness", feature = "thread_spread", feature = "thread_nospread"))] pu: usize) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("Lace Worker".to_string())
+            
+            // we might want to be able to change this. OxiDD defaults to 1GiB for Rayon, much more than this 16MiB
+            // if we add this, it would be used in oxidd-manager-index/src/workers.rs Workers::new
             .stack_size(1024 * 1024 * 16)
             .spawn(move || {
                 #[cfg(any(feature = "numa_awareness", feature = "thread_spread", feature = "thread_nospread"))]
@@ -455,6 +458,7 @@ pub struct Lace {
     keep_going: Arc<AtomicBool>,
     #[cfg(feature = "metrics")]
     worker_metrics: Vec<Arc<Metrics>>,
+    num_workers: usize,
 }
 impl Lace {
     pub fn init(n: usize) -> Self {
@@ -490,6 +494,7 @@ impl Lace {
             keep_going,
             #[cfg(feature = "metrics")]
             worker_metrics,
+            num_workers: n,
         };
         #[cfg(any(feature = "thread_spread", feature = "thread_nospread"))]
         {
@@ -623,6 +628,11 @@ impl Lace {
             println!("worker {id:2}: {:?}", m);
         }
         println!("total: {:?}", total.normalized(normf));
+    }
+
+    #[inline]
+    pub fn num_workers(&self) -> usize {
+        self.num_workers
     }
 }
 // safeguard in case people forget to call stop()
