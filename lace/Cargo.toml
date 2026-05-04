@@ -1,0 +1,69 @@
+[package]
+name = "lace"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+
+# enable "unsafe" use in certain areas
+unsafe_task = []
+unsafe_buffer = []
+unsafe_arena = []
+unsafe_steal = []
+unsafe_atomic = []
+# un-mute common::muteable_assert
+extra_assertions = []
+# use random stealing when thieves have no tasks to steal back from
+leapfrog_random = []
+# use an exponential backoff when stealing fails
+steal_backoff = []
+# swap out the lace deque for a chase-lev deque
+chase_lev = ["dep:crossbeam-deque", "unsafe_arena"]
+# record metrics on deque usage
+metrics = []
+# experiment using stronger memory ordering for split point update requests (acquire-release ordering is already implied by the architecture)
+stronger_splitreq = []
+# experiment pinning threads to a single socket or spreading them
+thread_nospread = ["dep:hwloc2"]
+thread_spread = ["dep:hwloc2"]
+# use 'hwloc' to bind threads to cores
+# requires libhwloc >=2.0 to be installed
+numa_awareness = ["dep:hwloc2"]
+
+[dependencies]
+lace-macros = { path = "../lace-macros" }
+crossbeam-deque = { version = "0.8", optional = true }
+crossbeam-utils = "0.8"
+hwloc2 = { version = "2.2.0", default-features = false, optional = true }
+[dev-dependencies]
+smallvec = "1.13.2"
+rayon = "1.10"
+cty = "0.2.2"
+[build-dependencies]
+cc = "1.0"
+
+[[bench]]
+name = "fib"
+harness = false
+[[bench]]
+name = "matmul"
+harness = false
+[[bench]]
+name = "queens"
+harness = false
+[[bench]]
+name = "dfs"
+harness = false
+[[bench]]
+name = "uts"
+harness = false
+[[bench]]
+name = "pi"
+harness = false
+
+[profile.test]
+inherits = "release"
+debug = true
+[profile.bench]
+inherits = "release"
