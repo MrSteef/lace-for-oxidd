@@ -1,6 +1,7 @@
+use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Drop;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -44,8 +45,6 @@ extern crate crossbeam_deque;
 use arena::picked::ArenaBox;
 #[cfg(feature = "chase_lev")]
 use crossbeam_deque::{Steal, Stealer, Worker as Deque};
-#[cfg(feature = "chase_lev")]
-use std::sync::atomic::AtomicUsize;
 
 #[allow(unused_macros)]
 macro_rules! wlog {
@@ -65,6 +64,69 @@ type TaskStealer = Stealer<TypeErasedTask>;
 type TaskDeque = Deque<(*mut TypeErasedTask, Arc<AtomicUsize>)>;
 #[cfg(feature = "chase_lev")]
 type TaskStealer = Stealer<(*mut TypeErasedTask, Arc<AtomicUsize>)>;
+
+/// Context passed to [`Lace::broadcast`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastContext {
+    index: usize,
+    num_workers: usize,
+}
+
+impl BroadcastContext {
+    /// The index of the worker currently running the broadcast operation.
+    #[inline]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The number of workers in this Lace instance.
+    #[inline]
+    pub fn num_workers(&self) -> usize {
+        self.num_workers
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BroadcastJob {
+    op: *const (),
+    results: *mut (),
+    num_workers: usize,
+    call: unsafe fn(*const (), usize, usize, *mut ()),
+}
+
+unsafe impl Send for BroadcastJob {}
+unsafe impl Sync for BroadcastJob {}
+
+struct BroadcastState {
+    epoch: AtomicUsize,
+    remaining: AtomicUsize,
+    job: UnsafeCell<Option<BroadcastJob>>,
+}
+
+unsafe impl Send for BroadcastState {}
+unsafe impl Sync for BroadcastState {}
+
+impl BroadcastState {
+    fn new() -> Self {
+        Self {
+            epoch: AtomicUsize::new(0),
+            remaining: AtomicUsize::new(0),
+            job: UnsafeCell::new(None),
+        }
+    }
+}
+
+unsafe fn call_broadcast<F, R>(op: *const (), index: usize, num_workers: usize, results: *mut ())
+where
+    F: Fn(BroadcastContext) -> R + Sync,
+    R: Send,
+{
+    let op = unsafe { &*(op as *const F) };
+    let results = results as *mut MaybeUninit<R>;
+    unsafe {
+        (*results.add(index)).write(op(BroadcastContext { index, num_workers }));
+    }
+}
 
 static NEXT_POOL_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -146,6 +208,8 @@ pub struct Worker {
     pool_id: usize,
     id: usize,
     keep_going: Arc<AtomicBool>,
+    broadcast: Arc<BroadcastState>,
+    broadcast_epoch: usize,
     arena: Arena,
     prng: prng::Lfsr,
     queue: TaskDeque,
@@ -160,6 +224,23 @@ impl Worker {
         pool_id: usize,
         id: usize,
         keep_going: Arc<AtomicBool>,
+        #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
+    ) -> (Self, TaskStealer) {
+        Self::new_with_broadcast(
+            pool_id,
+            id,
+            keep_going,
+            Arc::new(BroadcastState::new()),
+            #[cfg(feature = "metrics")]
+            metrics,
+        )
+    }
+
+    fn new_with_broadcast(
+        pool_id: usize,
+        id: usize,
+        keep_going: Arc<AtomicBool>,
+        broadcast: Arc<BroadcastState>,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
     ) -> (Self, TaskStealer) {
         #[cfg(not(feature = "chase_lev"))]
@@ -182,6 +263,8 @@ impl Worker {
                 prng: prng::Lfsr::new(id),
                 steal_handles: Vec::new(),
                 keep_going,
+                broadcast,
+                broadcast_epoch: 0,
                 #[cfg(feature = "chase_lev")]
                 recycle_thief: Vec::new(),
                 #[cfg(feature = "metrics")]
@@ -471,6 +554,24 @@ impl Worker {
 }
 
 impl Worker {
+    fn try_run_broadcast(&mut self) -> bool {
+        let epoch = self.broadcast.epoch.load(Ordering::Acquire);
+        if epoch == self.broadcast_epoch {
+            return false;
+        }
+
+        self.broadcast_epoch = epoch;
+        let job = unsafe {
+            (*self.broadcast.job.get())
+                .expect("broadcast epoch published without a job")
+        };
+        unsafe {
+            (job.call)(job.op, self.id, job.num_workers, job.results);
+        }
+        self.broadcast.remaining.fetch_sub(1, Ordering::Release);
+        true
+    }
+
     #[cfg(any(feature = "numa_awareness", feature = "thread_spread", feature = "thread_nospread"))]
     fn numa_bind(&mut self, pu: usize) {
         let mut topo = Topology::new().unwrap();
@@ -530,7 +631,9 @@ impl Worker {
                     // these don't change over the lifetime of the thread,
                     // so we can safely make local copies
                     while worker.keep_going.load(Ordering::Relaxed) {
-                        worker.steal_random();
+                        if !worker.try_run_broadcast() {
+                            worker.steal_random();
+                        }
                     }
                 });
             })
@@ -543,6 +646,7 @@ pub struct Lace {
     root_worker: Worker,
     handles: Vec<thread::JoinHandle<()>>,
     keep_going: Arc<AtomicBool>,
+    broadcast: Arc<BroadcastState>,
     #[cfg(feature = "metrics")]
     worker_metrics: Vec<Arc<Metrics>>,
     num_workers: usize,
@@ -552,6 +656,7 @@ impl Lace {
         assert!(n != 0, "invalid number of workers");
         let pool_id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let keep_going = Arc::from(AtomicBool::new(true));
+        let broadcast = Arc::new(BroadcastState::new());
         let mut workers = Vec::new();
         let mut steal_handles = Vec::new();
         #[cfg(feature = "metrics")]
@@ -560,10 +665,11 @@ impl Lace {
         for id in 0..n {
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
-            let (w, s) = Worker::new(
+            let (w, s) = Worker::new_with_broadcast(
                 pool_id,
                 id,
                 keep_going.clone(),
+                broadcast.clone(),
                 #[cfg(feature = "metrics")]
                 metrics.clone(),
             );
@@ -582,6 +688,7 @@ impl Lace {
             root_worker: workers.remove(0),
             handles: Vec::new(),
             keep_going,
+            broadcast,
             #[cfg(feature = "metrics")]
             worker_metrics,
             num_workers: n,
@@ -702,6 +809,45 @@ impl Lace {
         with_current_worker(pool_id, &mut self.root_worker, f)
     }
 
+    pub fn broadcast<F, R>(&mut self, op: F) -> Vec<R>
+    where
+        F: Fn(BroadcastContext) -> R + Sync,
+        R: Send,
+    {
+        let num_workers = self.num_workers;
+        let mut results = Vec::with_capacity(num_workers);
+        results.resize_with(num_workers, MaybeUninit::<R>::uninit);
+
+        unsafe {
+            *self.broadcast.job.get() = Some(BroadcastJob {
+                op: &op as *const _ as *const (),
+                results: results.as_mut_ptr() as *mut (),
+                num_workers,
+                call: call_broadcast::<F, R>,
+            });
+        }
+
+        self.broadcast.remaining.store(num_workers, Ordering::Release);
+        self.broadcast.epoch.fetch_add(1, Ordering::AcqRel);
+
+        let pool_id = self.pool_id;
+        with_current_worker(pool_id, &mut self.root_worker, |worker| {
+            worker.try_run_broadcast();
+        });
+        while self.broadcast.remaining.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
+
+        unsafe {
+            *self.broadcast.job.get() = None;
+            let ptr = results.as_mut_ptr() as *mut R;
+            let len = results.len();
+            let cap = results.capacity();
+            std::mem::forget(results);
+            Vec::from_raw_parts(ptr, len, cap)
+        }
+    }
+
     pub fn stop(&mut self) {
         self.keep_going.store(false, Ordering::Relaxed);
         for handle in self.handles.drain(..) {
@@ -802,4 +948,23 @@ mod tests {
             assert_eq!(x, 8 * 7 * 6 * 5 * 4 * 3 * 2 * 1);
         }
     }
+    fn current_worker_id(worker: &mut Worker, _: ()) -> usize {
+        worker.id
+    }
+
+    #[test]
+    fn broadcast_runs_on_each_worker() {
+        let mut lace = Lace::init(4);
+        let pool_id = lace.pool_id();
+        let mut seen = lace.broadcast(|ctx| {
+            let current = try_run_current(pool_id, current_worker_id, ())
+                .expect("broadcast did not run inside a Lace worker");
+            assert_eq!(current, ctx.index());
+            assert_eq!(ctx.num_workers(), 4);
+            ctx.index()
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+    }
+
 }
