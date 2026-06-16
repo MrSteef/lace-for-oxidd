@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 use std::ops::Drop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -65,7 +66,84 @@ type TaskDeque = Deque<(*mut TypeErasedTask, Arc<AtomicUsize>)>;
 #[cfg(feature = "chase_lev")]
 type TaskStealer = Stealer<(*mut TypeErasedTask, Arc<AtomicUsize>)>;
 
+static NEXT_POOL_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy)]
+struct CurrentWorker {
+    pool_id: usize,
+    worker: *mut Worker,
+}
+
+impl CurrentWorker {
+    const NONE: Self = Self {
+        pool_id: usize::MAX,
+        worker: std::ptr::null_mut(),
+    };
+}
+
+thread_local! {
+    static CURRENT_WORKER: Cell<CurrentWorker> = Cell::new(CurrentWorker::NONE);
+}
+
+fn with_current_worker<O>(
+    pool_id: usize,
+    worker: &mut Worker,
+    f: impl FnOnce(&mut Worker) -> O,
+) -> O {
+    CURRENT_WORKER.with(|cell| {
+        let prev = cell.replace(CurrentWorker {
+            pool_id,
+            worker: worker as *mut Worker,
+        });
+
+        struct Reset<'a> {
+            cell: &'a Cell<CurrentWorker>,
+            prev: CurrentWorker,
+        }
+
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.cell.set(self.prev);
+            }
+        }
+
+        let _reset = Reset { cell, prev };
+
+        f(worker)
+    })
+}
+
+pub fn try_run_current<I, O>(
+    pool_id: usize,
+    task: fn(&mut Worker, I) -> O,
+    input: I,
+) -> Result<O, I> {
+    let mut input = Some(input);
+
+    let output = CURRENT_WORKER.with(|cell| {
+        let current = cell.get();
+
+        if current.worker.is_null() || current.pool_id != pool_id {
+            return None;
+        }
+
+        // SAFETY:
+        // Lace sets this pointer only while the current thread is executing
+        // with exclusive access to that worker. The task runs synchronously
+        // and does not store the reference.
+        let worker = unsafe { &mut *current.worker };
+
+        Some(task(worker, input.take().unwrap()))
+    });
+
+    match output {
+        Some(output) => Ok(output),
+        None => Err(input.unwrap()),
+    }
+}
+
 pub struct Worker {
+    pool_id: usize,
     id: usize,
     keep_going: Arc<AtomicBool>,
     arena: Arena,
@@ -79,6 +157,7 @@ pub struct Worker {
 }
 impl Worker {
     pub fn new(
+        pool_id: usize,
         id: usize,
         keep_going: Arc<AtomicBool>,
         #[cfg(feature = "metrics")] metrics: Arc<Metrics>,
@@ -96,6 +175,7 @@ impl Worker {
 
         (
             Self {
+                pool_id,
                 id,
                 arena: Arena::new(),
                 queue,
@@ -114,6 +194,7 @@ impl Worker {
     #[cfg(test)]
     pub fn mock() -> Self {
         Self::new(
+            0,
             0,
             Arc::new(AtomicBool::from(true)),
             #[cfg(feature = "metrics")]
@@ -440,19 +521,25 @@ impl Worker {
             // if we add this, it would be used in oxidd-manager-index/src/workers.rs Workers::new
             .stack_size(1024 * 1024 * 16)
             .spawn(move || {
-                #[cfg(any(feature = "numa_awareness", feature = "thread_spread", feature = "thread_nospread"))]
-                self.numa_bind(pu);
-                // these don't change over the lifetime of the thread,
-                // so we can safely make local copies
-                while self.keep_going.load(Ordering::Relaxed) {
-                    self.steal_random();
-                }
+                let pool_id = self.pool_id;
+                
+                with_current_worker(pool_id, &mut self, |worker| {
+                    #[cfg(any(feature = "numa_awareness", feature = "thread_spread", feature = "thread_nospread"))]
+                    worker.numa_bind(pu);
+                    
+                    // these don't change over the lifetime of the thread,
+                    // so we can safely make local copies
+                    while worker.keep_going.load(Ordering::Relaxed) {
+                        worker.steal_random();
+                    }
+                });
             })
             .expect("Failed to spawn Lace Worker Thread")
     }
 }
 
 pub struct Lace {
+    pool_id: usize,
     root_worker: Worker,
     handles: Vec<thread::JoinHandle<()>>,
     keep_going: Arc<AtomicBool>,
@@ -463,6 +550,7 @@ pub struct Lace {
 impl Lace {
     pub fn init(n: usize) -> Self {
         assert!(n != 0, "invalid number of workers");
+        let pool_id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let keep_going = Arc::from(AtomicBool::new(true));
         let mut workers = Vec::new();
         let mut steal_handles = Vec::new();
@@ -473,6 +561,7 @@ impl Lace {
             #[cfg(feature = "metrics")]
             let metrics = Arc::new(Metrics::default());
             let (w, s) = Worker::new(
+                pool_id,
                 id,
                 keep_going.clone(),
                 #[cfg(feature = "metrics")]
@@ -489,6 +578,7 @@ impl Lace {
         }
         // only start n-1 extra threads, the main thread is the root worker
         let mut out = Self {
+            pool_id,
             root_worker: workers.remove(0),
             handles: Vec::new(),
             keep_going,
@@ -608,7 +698,8 @@ impl Lace {
 
     #[inline(always)]
     pub fn run<O>(&mut self, f: impl FnOnce(&mut Worker) -> O) -> O {
-        f(&mut self.root_worker)
+        let pool_id = self.pool_id;
+        with_current_worker(pool_id, &mut self.root_worker, f)
     }
 
     pub fn stop(&mut self) {
@@ -628,6 +719,11 @@ impl Lace {
             println!("worker {id:2}: {:?}", m);
         }
         println!("total: {:?}", total.normalized(normf));
+    }
+
+    #[inline]
+    pub fn pool_id(&self) -> usize {
+        self.pool_id
     }
 
     #[inline]
